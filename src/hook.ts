@@ -1078,7 +1078,11 @@ export async function handleStop(): Promise<void> {
 }
 
 export async function handleUserPromptSubmit(): Promise<void> {
-  const ignored = await checkIgnoreAsync();
+  // UserPromptSubmit injects context rather than capturing, and injection is
+  // gated by injectionEnabled() inside processUserPromptSubmit() — so the ignore
+  // result is not consumed here. The await keeps the ignore-check surface
+  // uniform with the other handlers (see handleSessionStart).
+  await checkIgnoreAsync();
   let raw = '';
   let oversized = false;
   process.stdin.setEncoding('utf-8');
