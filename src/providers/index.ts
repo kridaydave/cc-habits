@@ -8,7 +8,6 @@ import { OllamaProvider } from './ollama';
 import { ClaudeCliProvider } from './claude-cli';
 import { GeminiCliProvider } from './gemini-cli';
 import { CodexCliProvider } from './codex-cli';
-import { AntigravityCliProvider } from './antigravity-cli';
 import { spawnSync } from 'child_process';
 import { storagePaths } from '../storage';
 
@@ -21,7 +20,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const REPO_SCAN_TIMEOUT_MS = 90_000;
 
 export interface ProviderConfig {
-  provider: 'anthropic' | 'openai' | 'groq' | 'ollama' | 'claude-cli' | 'gemini-cli' | 'codex-cli' | 'antigravity-cli';
+  provider: 'anthropic' | 'openai' | 'groq' | 'ollama' | 'claude-cli' | 'gemini-cli' | 'codex-cli';
   anthropic_api_key?: string;
   openai_api_key?: string;
   openai_model?: string;
@@ -51,62 +50,21 @@ function readConfig(): ProviderConfig {
   }
   try {
     const text = fs.readFileSync(configPath, 'utf-8');
-    const lines = text.split('\n').map(line => {
-      const hashIdx = line.indexOf('#');
-      return hashIdx !== -1 ? line.slice(0, hashIdx) : line;
-    });
-    const cleanText = lines.join('\n');
     const read = (key: string): string | undefined => {
-      const m = cleanText.match(new RegExp(`^${key}\\s*:\\s*["']?([^\\s"'\\n]+)["']?`, 'm'));
+      // Anchor at column 0 with the multiline flag, consistent with
+      // setConfigValue/getConfigValue in config.ts. Without `^...`/`m` an
+      // unanchored match reads the first occurrence anywhere in the file, so a
+      // commented-out `# provider: openai` above `provider: ollama` would win,
+      // and a key that is a suffix of another (`x_provider:`) could match too.
+      // `#` inside a value stays intact: `[^\s"'\n]+` already stops the value at
+      // whitespace, so an inline `key: value # note` is handled without a naive
+      // comment-strip that would truncate a value legitimately containing `#`
+      // (e.g. an ollama_url with an embedded credential).
+      const m = text.match(new RegExp(`^[ \\t]*${key}\\s*:\\s*["']?([^\\s"'\\n]+)["']?`, 'm'));
       return m ? m[1] : undefined;
     };
     const provider = read('provider');
-    if (provider === 'openai' || provider === 'groq' || provider === 'ollama' || provider === 'anthropic' || provider === 'claude-cli' || provider === 'gemini-cli' || provider === 'codex-cli' || provider === 'antigravity-cli') {
-      cfg.provider = provider;
-    }
-    cfg.anthropic_api_key = read('anthropic_api_key');
-    cfg.openai_api_key = read('openai_api_key');
-    cfg.openai_model = read('openai_model');
-    cfg.openai_base_url = read('openai_base_url');
-    cfg.groq_api_key = read('groq_api_key');
-    cfg.groq_model = read('groq_model');
-    cfg.ollama_url = read('ollama_url');
-    cfg.ollama_model = read('ollama_model');
-  } catch {
-    // fall through to default
-  }
-  return cfg;
-}
-
-async function readConfigAsync(): Promise<ProviderConfig> {
-  const cfg: ProviderConfig = { provider: 'anthropic' };
-  let configPath = storagePaths.configFile;
-  if (!fs.existsSync(configPath)) {
-    if (!process.env['CC_HABITS_DIR']) {
-      const globalConfig = path.join(os.homedir(), '.cc-habits', 'config.yml');
-      try {
-        await fs.promises.access(globalConfig);
-        configPath = globalConfig;
-      } catch {
-        return cfg;
-      }
-    } else {
-      return cfg;
-    }
-  }
-  try {
-    const text = await fs.promises.readFile(configPath, 'utf-8');
-    const lines = text.split('\n').map(line => {
-      const hashIdx = line.indexOf('#');
-      return hashIdx !== -1 ? line.slice(0, hashIdx) : line;
-    });
-    const cleanText = lines.join('\n');
-    const read = (key: string): string | undefined => {
-      const m = cleanText.match(new RegExp(`^${key}\\s*:\\s*["']?([^\\s"'\\n]+)["']?`, 'm'));
-      return m ? m[1] : undefined;
-    };
-    const provider = read('provider');
-    if (provider === 'openai' || provider === 'groq' || provider === 'ollama' || provider === 'anthropic' || provider === 'claude-cli' || provider === 'gemini-cli' || provider === 'codex-cli' || provider === 'antigravity-cli') {
+    if (provider === 'openai' || provider === 'groq' || provider === 'ollama' || provider === 'anthropic' || provider === 'claude-cli' || provider === 'gemini-cli' || provider === 'codex-cli') {
       cfg.provider = provider;
     }
     cfg.anthropic_api_key = read('anthropic_api_key');
@@ -195,7 +153,7 @@ export function extractionPrivacyNote(): string {
 // CLI-linking providers are parked for this release (reachable only via an
 // explicit --provider, never the default UX). Treated as not-usable everywhere
 // the front door decides whether to offer or run an extraction.
-const PARKED_PROVIDERS: readonly string[] = ['claude-cli', 'gemini-cli', 'codex-cli', 'antigravity-cli'];
+const PARKED_PROVIDERS: readonly string[] = ['claude-cli', 'gemini-cli', 'codex-cli'];
 
 export function isParkedProvider(provider: string): boolean {
   return PARKED_PROVIDERS.includes(provider);
@@ -274,8 +232,8 @@ export async function checkProviderReady(): Promise<ProviderReadiness> {
   }
 }
 
-export function selectProvider(cfgInput?: ProviderConfig): Provider {
-  const cfg = cfgInput ?? readConfig();
+export function selectProvider(): Provider {
+  const cfg = readConfig();
 
   // Env vars override config file selection.
   const forced = process.env['CC_HABITS_PROVIDER'];
@@ -289,9 +247,6 @@ export function selectProvider(cfgInput?: ProviderConfig): Provider {
   }
   if (chosen === 'codex-cli') {
     return new CodexCliProvider();
-  }
-  if (chosen === 'antigravity-cli') {
-    return new AntigravityCliProvider();
   }
   if (chosen === 'openai') {
     const key = process.env['OPENAI_API_KEY'] ?? cfg.openai_api_key;
@@ -389,8 +344,7 @@ export function resetOllamaAnnounceForTests(): void {
 // extraction paths. Falls back to Ollama only when no cloud provider is usable.
 export async function selectProviderAsync(): Promise<Provider> {
   try {
-    const cfg = await readConfigAsync();
-    return selectProvider(cfg);
+    return selectProvider();
   } catch (e) {
     if (!shouldTryOllamaFallback()) throw e;
     const found = await detectOllama();
