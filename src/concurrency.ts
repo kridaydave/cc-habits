@@ -6,6 +6,11 @@
 // on constrained CI. This caps the in-flight work at `limit` while preserving
 // the input order of the results, so callers that depended on ordering (e.g.
 // "newest-file-last" capture logs) keep behaving deterministically.
+//
+// A worker must handle its own errors: a throw/reject abandons the whole pool
+// because the internal Promise.all rejects immediately and leaves the remaining
+// in-flight work dangling (never awaited, never cleaned up). Wrap per-item work
+// in try/catch and return a sentinel (e.g. null) on failure instead.
 export async function mapWithConcurrencyLimit<T, R>(
   items: readonly T[],
   limit: number,

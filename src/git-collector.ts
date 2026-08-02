@@ -18,6 +18,10 @@ const execFileAsync = promisify(execFile);
 // contain the usual ref characters plus a single ".." range separator.
 const SAFE_REF = /^[A-Za-z0-9_/][A-Za-z0-9_./~^-]*(\.\.[A-Za-z0-9_./~^-]+)?$/;
 
+// Bounds fan-out per commit to avoid FD/PID exhaustion on large commits while
+// keeping capture fast. Each entry spawns a git child process.
+const MAX_GIT_DIFF_CONCURRENCY = 8;
+
 async function git(args: string[], cwdOverride?: string, ignoreOutput = false): Promise<string> {
   const options = {
     encoding: 'utf-8' as const,
@@ -92,7 +96,7 @@ export async function runGitCapture(range?: string, cwdOverride?: string): Promi
       // array stays newest-file-last deterministically.
       const capturedForCommit = await mapWithConcurrencyLimit(
         files,
-        8,
+        MAX_GIT_DIFF_CONCURRENCY,
         async (file) => {
           try {
             const diff = await git(['diff', parent, sha, '--', file], cwdOverride);
