@@ -39,13 +39,17 @@ export interface ProviderConfig {
 // duplicated with the risk of drifting apart.
 function parseProviderConfig(text: string): ProviderConfig {
   const cfg: ProviderConfig = { provider: 'anthropic' };
-  const lines = text.split('\n').map(line => {
-    const hashIdx = line.indexOf('#');
-    return hashIdx !== -1 ? line.slice(0, hashIdx) : line;
-  });
-  const cleanText = lines.join('\n');
   const read = (key: string): string | undefined => {
-    const m = cleanText.match(new RegExp(`^${key}\\s*:\\s*["']?([^\\s"'\\n]+)["']?`, 'm'));
+    // Anchor at column 0 with the multiline flag, consistent with
+    // setConfigValue/getConfigValue in config.ts. Without `^...`/`m` an
+    // unanchored match reads the first occurrence anywhere in the file, so a
+    // commented-out `# provider: openai` above `provider: ollama` would win,
+    // and a key that is a suffix of another (`x_provider:`) could match too.
+    // `#` inside a value stays intact: `[^\\s"'\\n]+` already stops the value at
+    // whitespace, so an inline `key: value # note` is handled without a naive
+    // comment-strip that would truncate a value legitimately containing `#`
+    // (e.g. an ollama_url with an embedded credential).
+    const m = text.match(new RegExp(`^[ \\t]*${key}\\s*:\\s*["']?([^\\s"'\\n]+)["']?`, 'm'));
     return m ? m[1] : undefined;
   };
   const provider = read('provider');
