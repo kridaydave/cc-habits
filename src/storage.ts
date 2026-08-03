@@ -298,12 +298,26 @@ function safeAppend(filePath: string, content: string): void {
 // silently grows past the 50 MB read guard. Best-effort: errors are swallowed
 // so a rotation failure never blocks the caller.
 function trimIfNeeded(filePath: string, maxLines: number): void {
+  // Read through a single open file descriptor so the size check (fstatSync)
+  // and the read observe exactly the same file, with no window for the path to
+  // be replaced or change between them — the TOCTOU that CodeQL flags on a
+  // statSync-then-readFileSync pair. Mirrors the open/fstatSync/read-from-fd
+  // pattern used by countSignals() lower in this file. trim is best-effort:
+  // errors are swallowed so a rotation failure never blocks the caller.
+  let fd: number | null = null;
   try {
-    const st = fs.statSync(filePath);
-    if (st.size <= LOG_ROTATE_BYTES) return;
-    const all = fs.readFileSync(filePath, 'utf-8')
+    const oNoFollow: number = (fs.constants as Record<string, number>)['O_NOFOLLOW'] ?? 0;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | oNoFollow);
+    const st = fs.fstatSync(fd);
+    if (st.size <= LOG_ROTATE_BYTES) {
+      fs.closeSync(fd);
+      return;
+    }
+    const all = fs.readFileSync(fd, 'utf-8')
       .split('\n')
       .filter(l => l.trim());
+    fs.closeSync(fd);
+    fd = null;
     // Preserve any leading `//` comment header (the self-describing log preamble)
     // so rotation trims only signal lines, never the explanation of the file.
     const header: string[] = [];
@@ -314,6 +328,9 @@ function trimIfNeeded(filePath: string, maxLines: number): void {
     safeWrite(filePath, [...header, ...records.slice(-maxLines)].join('\n') + '\n');
   } catch {
     // trim is best-effort; never crash the caller
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* best-effort: fd may already be closed */ }
+    }
   }
 }
 

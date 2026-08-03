@@ -38,8 +38,6 @@ async function git(args: string[], cwdOverride?: string, ignoreOutput = false): 
 
 export interface GitCaptureResult {
   signalsCaptured: number;
-  // What was captured, newest-file-last, so the CLI can show the user exactly
-  // what landed in the log without making them open `cch log`.
   captured: Array<{ file: string; commit: string }>;
 }
 
