@@ -280,8 +280,14 @@ function safeAppend(filePath: string, content: string): void {
     }
   } else {
     // Windows fallback: lstat guard is best-effort (TOCTOU race still possible there).
-    if (fs.existsSync(filePath) && fs.lstatSync(filePath).isSymbolicLink()) {
-      throw new Error(`refusing to append through symlink: ${filePath}`);
+    try {
+      if (fs.lstatSync(filePath).isSymbolicLink()) {
+        throw new Error(`refusing to append through symlink: ${filePath}`);
+      }
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') {
+        throw e;
+      }
     }
     fs.appendFileSync(filePath, content, { encoding: 'utf-8', mode: FILE_MODE });
   }
@@ -292,22 +298,26 @@ function safeAppend(filePath: string, content: string): void {
 // silently grows past the 50 MB read guard. Best-effort: errors are swallowed
 // so a rotation failure never blocks the caller.
 function trimIfNeeded(filePath: string, maxLines: number): void {
+  // Read through a single open file descriptor so the size check (fstatSync)
+  // and the read observe exactly the same file, with no window for the path to
+  // be replaced or change between them — the TOCTOU that CodeQL flags on a
+  // statSync-then-readFileSync pair. Mirrors the open/fstatSync/read-from-fd
+  // pattern used by countSignals() lower in this file. trim is best-effort:
+  // errors are swallowed so a rotation failure never blocks the caller.
+  let fd: number | null = null;
   try {
-    // Single stat for the size check: the previous existsSync + statSync pair did
-    // two stat syscalls on every append (the common path is "well under the limit,
-    // return"). One statSync covers both: an absent file throws ENOENT, which the
-    // inner catch turns into an early return. Also closes the existsSync/statSync
-    // TOCTOU gap where the file could vanish between the two calls.
-    let size: number;
-    try {
-      size = fs.statSync(filePath).size;
-    } catch {
-      return; // absent or unstattable: nothing to trim
+    const oNoFollow: number = (fs.constants as Record<string, number>)['O_NOFOLLOW'] ?? 0;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | oNoFollow);
+    const st = fs.fstatSync(fd);
+    if (st.size <= LOG_ROTATE_BYTES) {
+      fs.closeSync(fd);
+      return;
     }
-    if (size <= LOG_ROTATE_BYTES) return;
-    const all = fs.readFileSync(filePath, 'utf-8')
+    const all = fs.readFileSync(fd, 'utf-8')
       .split('\n')
       .filter(l => l.trim());
+    fs.closeSync(fd);
+    fd = null;
     // Preserve any leading `//` comment header (the self-describing log preamble)
     // so rotation trims only signal lines, never the explanation of the file.
     const header: string[] = [];
@@ -318,6 +328,9 @@ function trimIfNeeded(filePath: string, maxLines: number): void {
     safeWrite(filePath, [...header, ...records.slice(-maxLines)].join('\n') + '\n');
   } catch {
     // trim is best-effort; never crash the caller
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* best-effort: fd may already be closed */ }
+    }
   }
 }
 
@@ -374,26 +387,59 @@ export function appendSignal(signal: Signal, ctx?: StorageContext): void {
   trimIfNeeded(paths.logFile, LOG_ROTATE_LINES);
 }
 
+// Open a file read-only (no symlink follow) and return its raw bytes, size-guarded
+// to MAX_LOG_READ_BYTES. Returns null when the file is absent. Operating on the
+// open fd (rather than re-stat/re-read by path) closes the existsSync -> stat ->
+// read TOCTOU race CodeQL flags, and O_NOFOLLOW refuses to open a symlink.
+function readFileBytesSafe(path: string, ctx?: StorageContext): Buffer | null {
+  let fd: number | null = null;
+  try {
+    const oNoFollow = (fs.constants as Record<string, number>)['O_NOFOLLOW'] ?? 0;
+    fd = fs.openSync(path, fs.constants.O_RDONLY | oNoFollow);
+    const st = fs.fstatSync(fd);
+    if (st.size > MAX_LOG_READ_BYTES) {
+      logError(`readFileBytesSafe: ${path} exceeds ${MAX_LOG_READ_BYTES} bytes; skipping read`, ctx);
+      fs.closeSync(fd);
+      return null;
+    }
+    const buf = fs.readFileSync(fd);
+    fs.closeSync(fd);
+    return buf;
+  } catch (e) {
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
 export function readSignals(sessionId?: string, ctx?: StorageContext): Signal[] {
   const paths = getPaths(ctx);
-  if (!fs.existsSync(paths.logFile)) return [];
-  // Guard against reading a runaway log file that could exhaust process memory.
-  const stat = fs.statSync(paths.logFile);
-  if (stat.size > MAX_LOG_READ_BYTES) {
-    // Log the oversized-file event and return empty rather than crash.
-    logError(`readSignals: log.jsonl exceeds ${MAX_LOG_READ_BYTES} bytes; skipping read`, ctx);
-    return [];
-  }
-  const lines = fs.readFileSync(paths.logFile, 'utf-8').split('\n');
+  const buf = readFileBytesSafe(paths.logFile, ctx);
+  if (!buf) return [];
   const signals: Signal[] = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const sig = JSON.parse(trimmed) as Signal;
-      if (!sessionId || sig.session_id === sessionId) signals.push(sig);
-    } catch {
-      // skip malformed line
+  let start = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 10) { // '\n'
+      const line = buf.toString('utf-8', start, i).trim();
+      start = i + 1;
+      if (!line) continue;
+      try {
+        const sig = JSON.parse(line) as Signal;
+        if (!sessionId || sig.session_id === sessionId) signals.push(sig);
+      } catch {
+        // skip malformed line
+      }
+    }
+  }
+  if (start < buf.length) {
+    const line = buf.toString('utf-8', start, buf.length).trim();
+    if (line) {
+      try {
+        const sig = JSON.parse(line) as Signal;
+        if (!sessionId || sig.session_id === sessionId) signals.push(sig);
+      } catch {
+        // skip malformed line
+      }
     }
   }
   return signals;
@@ -757,18 +803,23 @@ export function appendHistory(entry: HistoryEntry, ctx?: StorageContext): void {
 
 export function readHistory(ctx?: StorageContext): HistoryEntry[] {
   const paths = getPaths(ctx);
-  if (!fs.existsSync(paths.historyFile)) return [];
-  const stat = fs.statSync(paths.historyFile);
-  if (stat.size > MAX_LOG_READ_BYTES) {
-    logError(`readHistory: .history.jsonl exceeds ${MAX_LOG_READ_BYTES} bytes; skipping read`, ctx);
-    return [];
-  }
-  const lines = fs.readFileSync(paths.historyFile, 'utf-8').split('\n');
+  const buf = readFileBytesSafe(paths.historyFile, ctx);
+  if (!buf) return [];
   const out: HistoryEntry[] = [];
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    try { out.push(JSON.parse(t) as HistoryEntry); } catch { /* skip */ }
+  let start = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 10) { // '\n'
+      const line = buf.toString('utf-8', start, i).trim();
+      start = i + 1;
+      if (!line) continue;
+      try { out.push(JSON.parse(line) as HistoryEntry); } catch { /* skip */ }
+    }
+  }
+  if (start < buf.length) {
+    const line = buf.toString('utf-8', start, buf.length).trim();
+    if (line) {
+      try { out.push(JSON.parse(line) as HistoryEntry); } catch { /* skip */ }
+    }
   }
   return out;
 }
