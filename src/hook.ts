@@ -17,7 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import {
-  appendSignal, readSignals, countSignals, readHabitsMd, parseHabits, writeHabitsMd,
+  appendSignal, readSignals, countSignals, appendInjectEvent, readHabitsMd, parseHabits, writeHabitsMd,
   serialiseHabits, logError, sanitizeFilePath, detectManualDeletes, writeSnapshot,
   addTombstone,
   appendHistory, appendProvenance, readMemoriesMd, applyMemoryUpdates, parseMemories,
@@ -652,7 +652,7 @@ function renderHabitsInjection(habits: InjectionHabit[]): string | null {
 
   const lines: string[] = [
     '<coding-habits>',
-    "Apply the developer's learned coding habits below when writing or editing code.",
+    "Apply the developer's learned habits below when writing or editing code or documentation.",
     'These are durable preferences; honor them unless the user says otherwise.',
   ];
   for (const [category, rules] of byCat) {
@@ -888,7 +888,7 @@ function safeRead(fn: () => string): string {
   try { return fn(); } catch { return ''; }
 }
 
-export function processUserPromptSubmit(data: Record<string, unknown>, ctx?: StorageContext): string | null {
+export function processUserPromptSubmit(data: Record<string, unknown>, ctx?: StorageContext, source = 'claude-code'): string | null {
   if (!injectionEnabled()) return null;
   const promptText = typeof data['prompt'] === 'string' ? data['prompt'] : '';
   const sessionId = String(data['session_id'] ?? data['sessionId'] ?? data['session'] ?? '');
@@ -906,6 +906,7 @@ export function processUserPromptSubmit(data: Record<string, unknown>, ctx?: Sto
     : buildInjectionContext(globalMd, langs, ctx);
 
   let memoriesContext: string | null = null;
+  let memoriesInjected = 0;
   if (memoriesEnabled(ctx)) {
     try {
       const globalMem = readMemoriesMd(ctx);
@@ -913,13 +914,36 @@ export function processUserPromptSubmit(data: Record<string, unknown>, ctx?: Sto
         ? selectMergedInjectionMemories(globalMem, safeRead(() => readMemoriesMd(repoCtx)), promptText, ctx, repoCtx)
         : selectInjectionMemories(globalMem, promptText, ctx);
       memoriesContext = buildMemoryInjectionContext(relevant);
+      memoriesInjected = memoriesContext ? relevant.length : 0;
     } catch {
       // injection failures must never block a prompt
     }
   }
 
-  if (habitsContext && memoriesContext) return habitsContext + '\n' + memoriesContext;
-  return habitsContext ?? memoriesContext;
+  const combined = habitsContext && memoriesContext
+    ? habitsContext + '\n' + memoriesContext
+    : habitsContext ?? memoriesContext;
+
+  // Proof of injection: record that learned context was actually returned to
+  // the tool (events.jsonl, rendered by `cch view` as the activity graph).
+  // Counts only, derived from the rendered block: each habit renders as one
+  // "- rule." line. Fail-open: a logging failure must never block the prompt.
+  if (combined) {
+    try {
+      appendInjectEvent({
+        ts: new Date().toISOString(),
+        type: 'inject',
+        session_id: sessionId,
+        source,
+        habits: habitsContext ? habitsContext.split('\n').filter(l => l.startsWith('- ')).length : 0,
+        memories: memoriesInjected,
+        scope: repoCtx ? 'merged' : 'global',
+      }, ctx);
+    } catch {
+      // never let audit logging break injection
+    }
+  }
+  return combined;
 }
 
 // Builds the SessionStart reminder. Habits/memories are already injected via the
@@ -1074,7 +1098,7 @@ export async function handleStop(): Promise<void> {
   process.exit(0);
 }
 
-export async function handleUserPromptSubmit(): Promise<void> {
+export async function handleUserPromptSubmit(adapter = 'claude-code'): Promise<void> {
   await checkIgnoreAsync();
   let raw = '';
   let oversized = false;
@@ -1091,7 +1115,7 @@ export async function handleUserPromptSubmit(): Promise<void> {
     if (!oversized) {
       try {
         const data = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {};
-        const context = processUserPromptSubmit(data);
+        const context = processUserPromptSubmit(data, undefined, adapter);
         // Plain stdout is added to Claude's context for UserPromptSubmit. Exit 0
         // always, injection must never block or fail a prompt.
         if (context) process.stdout.write(context + '\n');
@@ -1124,7 +1148,7 @@ export function hookMain(): void {
     try {
       if (event === 'post-tool-use') await handlePostToolUse(adapter);
       else if (event === 'stop') await handleStop();
-      else if (event === 'user-prompt-submit') await handleUserPromptSubmit();
+      else if (event === 'user-prompt-submit') await handleUserPromptSubmit(adapter);
       else if (event === 'session-start') await handleSessionStart(adapter);
       else if (KNOWN_UNSUPPORTED_EVENTS.has(event)) {
         // Deliberate no-op (e.g. subagent-stop). See hook-schema.ts for why:
